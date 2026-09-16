@@ -53,3 +53,4 @@ python screen.py --equity 20000   # scan complet, sizing pour 20 000 €
 - Les listes thématiques sont statiques. C'est un choix : un classifieur
   automatique de secteur est bruité et non auditable.
 - **Rien ici n'a été backtesté.** C'est l'étape suivante, avant tout argent réel.
+"# momentum_screener" 
