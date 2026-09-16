@@ -58,3 +58,4 @@ python screen.py --equity 20000   # scan complet, sizing pour 20 000 €
 "# momentum_screener" 
 "# momentum_screener" 
 "# momentum_screener" 
+"# momentum_screener" 
