@@ -1,0 +1,17 @@
+# Secrets (CRITIQUE)
+.env
+
+# Environnements virtuels
+venv/
+env/
+
+# Fichiers compilés Python
+__pycache__/
+*.pyc
+
+# Volumes Docker et Base de données
+pg_data/
+*.sql
+
+# Logs
+*.log

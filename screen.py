@@ -1,131 +1,120 @@
-#!/usr/bin/env python3
 """
-screen.py — point d'entrée du screener.
-
-Usage :
-    export ALPACA_API_KEY=...  ALPACA_SECRET_KEY=...
-    python screen.py                 # univers complet (~5000 titres, ~5 min)
-    python screen.py --themes-only   # uniquement les listes thématiques (rapide)
-    python screen.py --equity 20000  # dimensionne les positions pour 20 000 €
-
-Sortie : candidats.csv + affichage console.
-CE SCRIPT NE PASSE AUCUN ORDRE. Il propose, vous décidez.
+screen.py — Moteur de scoring et de classement Momentum.
 """
-
-from __future__ import annotations
-
-import argparse
-import sys
-from datetime import datetime
-
+import logging
 import pandas as pd
+import numpy as np
+from config import Config
 
-from config import Config, THEMES, theme_of
-import data as dta
-import signals as sig
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+cfg = Config()
 
+def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Calcul vectorisé de l'Average True Range (ATR) pour la gestion du risque."""
+    high = df['high']
+    low = df['low']
+    close_prev = df['close'].shift(1)
+    
+    tr1 = high - low
+    tr2 = (high - close_prev).abs()
+    tr3 = (low - close_prev).abs()
+    
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    return tr.rolling(window=period).mean()
 
-def build_candidates(
-    bars: dict[str, pd.DataFrame],
-    cfg: Config,
-    ipo_symbols: set[str],
-) -> pd.DataFrame:
-    bench = bars.get(cfg.benchmark)
-    bench_close = bench["close"] if bench is not None else None
+def score_asset(symbol: str, df: pd.DataFrame) -> dict | None:
+    """
+    Extrait les métriques mathématiques d'un DataFrame OHLCV et génère un score.
+    Retourne None si l'actif est jugé trop risqué ou invalide.
+    """
+    # Filtre 1 : Historique minimum (63 jours = 3 mois de bourse)
+    if len(df) < 63:
+        return None
 
-    rows, rejets = [], {}
-    for symbol, df in bars.items():
-        if symbol == cfg.benchmark or df.empty:
-            continue
-        f = sig.compute_features(df, bench_close)
-        ok, why = sig.passes_hard_filters(f, cfg)
-        if not ok:
-            rejets[why] = rejets.get(why, 0) + 1
-            continue
+    current_price = df['close'].iloc[-1]
+    
+    # Sécurité absolue : Éviter les divisions par zéro sur des actions illiquides
+    if current_price <= 0:
+        return None
 
-        theme = theme_of(symbol)
-        bonus = 0.0
-        if theme:
-            bonus += cfg.bonus_theme
-        if symbol in ipo_symbols:
-            bonus += cfg.bonus_recent_ipo
+    price_1m_ago = df['close'].iloc[-21]
+    price_3m_ago = df['close'].iloc[-63]
 
-        rows.append({"symbol": symbol, "theme": theme or "", "is_ipo": symbol in ipo_symbols,
-                     "theme_bonus": bonus, **f})
+    # Calcul des rendements directionnels
+    ret_1m = (current_price - price_1m_ago) / price_1m_ago
+    ret_3m = (current_price - price_3m_ago) / price_3m_ago
 
-    print(f"\nRejets : {dict(sorted(rejets.items(), key=lambda x: -x[1]))}")
-    if not rows:
+    # Calcul du volume anormal (Surge) - 5 jours vs 63 jours
+    vol_recent = df['volume'].tail(5).mean()
+    vol_historic = df['volume'].tail(63).mean()
+    vol_surge = (vol_recent / vol_historic) if vol_historic > 0 else 1.0
+    
+    # Plafonnement du volume surge pour éviter qu'un volume extrême d'un jour écrase le score
+    vol_surge = min(vol_surge, 5.0) 
+
+    # Filtre de volatilité extrême (Filtre anti-anomalies / anti-penny stocks délirants)
+    atr_series = calculate_atr(df)
+    current_atr = atr_series.iloc[-1]
+    atr_pct = current_atr / current_price
+
+    if atr_pct > 0.15:  # Si l'action bouge de plus de 15% par jour en moyenne, on rejette (Intradable en Swing)
+        return None
+
+    # Normalisation mathématique basique (Somme pondérée via config.py)
+    score = (ret_1m * cfg.w_ret_1m) + (ret_3m * cfg.w_ret_3m) + (vol_surge * cfg.w_vol_surge)
+
+    return {
+        "symbol": symbol,
+        "score": round(score, 4),
+        "close": round(current_price, 2),
+        "ret_1m_%": round(ret_1m * 100, 2),
+        "ret_3m_%": round(ret_3m * 100, 2),
+        "vol_surge": round(vol_surge, 2),
+        "atr_pct": round(atr_pct, 4)
+    }
+
+def run_screener(bars_dict: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """
+    Orchestrateur : Analyse tout le dictionnaire de données et renvoie le classement.
+    """
+    logging.info(f"Analyse quantitative de {len(bars_dict)} actifs en cours...")
+    
+    results = []
+    for sym, df in bars_dict.items():
+        res = score_asset(sym, df)
+        if res:
+            results.append(res)
+            
+    if not results:
+        logging.warning("Aucun actif n'a passé les filtres mathématiques.")
         return pd.DataFrame()
 
-    out = pd.DataFrame(rows).set_index("symbol")
-    return sig.score_universe(out, cfg)
+    results_df = pd.DataFrame(results)
+    
+    # Tri descendant par score de momentum
+    results_df = results_df.sort_values(by="score", ascending=False).reset_index(drop=True)
+    
+    logging.info(f"Screener terminé. {len(results_df)} actifs scorés avec succès.")
+    return results_df
 
-
-def main() -> int:
-    p = argparse.ArgumentParser()
-    p.add_argument("--themes-only", action="store_true",
-                   help="ne scanner que les listes thématiques de config.py")
-    p.add_argument("--equity", type=float, default=10_000.0,
-                   help="capital total, pour le dimensionnement des positions")
-    p.add_argument("--top", type=int, default=None)
-    p.add_argument("--out", default="candidats.csv")
-    args = p.parse_args()
-
-    cfg = Config()
-    if args.top:
-        cfg.top_n = args.top
-
-    # 1. univers
-    if args.themes_only:
-        symbols = sorted({s for lst in THEMES.values() for s in lst})
-        print(f"Univers thématique : {len(symbols)} titres")
-    else:
-        print("Récupération de l'univers Alpaca…")
-        uni = dta.get_universe()
-        symbols = uni["symbol"].tolist()
-        print(f"Univers : {len(symbols)} titres négociables")
-
-    if cfg.benchmark not in symbols:
-        symbols.append(cfg.benchmark)
-
-    # 2. données
-    print("Téléchargement des barres journalières…")
-    bars = dta.get_daily_bars(symbols)
-    print(f"{len(bars)} historiques récupérés")
-
-    # 3. IPO récentes
-    ipos = dta.get_recent_ipos(cfg.ipo_window_days)
-    ipo_symbols = set(ipos["symbol"]) if not ipos.empty else set()
-    ipo_symbols |= dta.infer_ipos_from_bars(bars, cfg.ipo_window_days)
-    print(f"{len(ipo_symbols)} cotations récentes identifiées")
-
-    # 4. scoring
-    ranked = build_candidates(bars, cfg, ipo_symbols)
-    if ranked.empty:
-        print("Aucun candidat ne passe les filtres aujourd'hui. C'est un résultat valide.")
-        return 0
-
-    top = ranked.head(cfg.top_n).copy()
-
-    # 5. dimensionnement
-    sizing = [sig.position_size(args.equity, r["last_close"], r["atr_pct"], cfg)
-              for _, r in top.iterrows()]
-    top["shares"] = [s["shares"] for s in sizing]
-    top["stop"] = [s["stop"] for s in sizing]
-    top["notional"] = [s.get("notional") for s in sizing]
-
-    cols = ["theme", "is_ipo", "score", "last_close", "ret_1m", "ret_3m", "rs_3m",
-            "dist_52w_high", "vol_surge", "atr_pct", "shares", "stop", "notional"]
-    view = top[cols].round(3)
-
-    print(f"\n=== TOP {len(view)} — {datetime.now():%Y-%m-%d %H:%M} ===")
-    print(view.to_string())
-
-    top.to_csv(args.out)
-    print(f"\nÉcrit dans {args.out}")
-    print("Rappel : ceci est une liste de candidats à examiner, pas une recommandation.")
-    return 0
-
-
+# --------------------------------------------------------------------- TEST LOCAL
 if __name__ == "__main__":
-    sys.exit(main())
+    import data
+    from database import DatabaseManager # <-- IMPORT DU MODULE DB
+    
+    print("\n--- Démarrage de la chaîne complète (Data + Screener) ---")
+    
+    universe = data.get_universe(max_symbols=100)
+    symbols = universe["symbol"].tolist()
+    
+    bars = data.get_daily_bars(symbols, lookback_days=100)
+    
+    if bars:
+        rankings = run_screener(bars)
+        print("\n🏆 TOP 10 MOMENTUM :")
+        print(rankings.head(10).to_string(index=False))
+        
+        # SAUVEGARDE EN BASE DE DONNÉES
+        DatabaseManager.save_screener_results(rankings)
+    else:
+        print("Erreur : Aucune donnée récupérée pour le screening.")

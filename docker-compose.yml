@@ -1,0 +1,33 @@
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    container_name: trading_timescaledb
+    restart: always
+    environment:
+      - POSTGRES_USER=horace_quant
+      - POSTGRES_PASSWORD=TradingPassword2026
+      - POSTGRES_DB=trading_db
+    ports:
+      - "5433:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+
+  screener:
+    build: .
+    container_name: trading_screener
+    depends_on:
+      - timescaledb
+    env_file:
+      - .env
+    environment:
+      # Écrasement explicite pour garantir la connexion
+      - DB_HOST=timescaledb
+      - DB_PORT=5432
+      - DB_USER=horace_quant
+      - DB_PASS=TradingPassword2026
+      - DB_NAME=trading_db
+    volumes:
+      - .:/app
+      
+volumes:
+  pg_data:
